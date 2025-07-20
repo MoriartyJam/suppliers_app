@@ -783,4 +783,5 @@ scheduler.add_job(func=run_all_updates, trigger='interval', minutes=5)
 scheduler.start()
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80, debug=False)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
