@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Loading Products</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: #f4f6f8;
+            padding: 40px;
+            color: #202223;
+        }
+        h1 {
+            font-size: 24px;
+            margin-bottom: 20px;
+        }
+        #editor {
+            width: 100%;
+            min-height: 200px;
+            padding: 12px;
+            font-size: 14px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            background: #fff;
+            white-space: pre-wrap;
+            outline: none;
+        }
+        #editor a {
+            color: #2a72d4;
+            text-decoration: underline;
+        }
+        button {
+            margin-top: 12px;
+            background-color: #5c6ac4;
+            color: #fff;
+            font-size: 14px;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #3d4dad;
+        }
+        .status {
+            margin-top: 24px;
+            background: #fff;
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+        }
+        p {
+            margin: 0 0 8px;
+        }
+        #editor:empty:before {
+          content: attr(data-placeholder);
+          color: #aaa;
+          pointer-events: none;
+        }
+        .spinner {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(255, 255, 255, 0.8);
+            z-index: 9999;
+        }
+        .spinner-inner {
+            border: 6px solid #eee;
+            border-top: 6px solid #5c6ac4;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 10px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <h1>Loading products</h1>
+    <form method="post" id="mainForm">
+        <div id="editor" contenteditable="true" data-placeholder="📝 Paste links one per line. Press Enter after each."></div>
+        <textarea name="links" id="realInput" style="display:none;"></textarea>
+        <button id="startButton" type="button">Start the process</button>
+        <button type="button" onclick="window.open('/download_csv', '_blank')">📥 Download the latest CSV</button>
+    </form>
+
+    <div style="margin-top: 40px; display: flex; gap: 40px; flex-wrap: wrap;">
+        <!-- Escentual Block -->
+        <div style="flex: 1; min-width: 280px; background: #fff; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
+            <h3>🧴 Escentual Parameters</h3>
+            <label>Price range:
+                <select id="escentual_price" style="width: 100%; padding: 6px; margin-top: 6px;">
+                    {% for option in ["0-10", "10.01-35", "35.01-50", "50.01-100", "100.01-150", "150.01-999"] %}
+                        <option value="{{ option }}" {% if escentual_settings.price_range == option %}selected{% endif %}>{{ option }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <br><br>
+            <label>Shipping fees:
+                <input id="escentual_shipping" type="number" style="width: 100%; padding: 6px; margin-top: 6px;" placeholder="5" value="{{ escentual_settings.shipping_fee }}">
+            </label>
+            <br><br>
+            <label>
+                <input id="escentual_surcharge" type="checkbox" {% if escentual_settings.surcharge %}checked{% endif %}> 10% surcharge
+            </label>
+            <br><br>
+            <button type="button" onclick="saveSettings('escentual')">Save the settings</button>
+        </div>
+
+        <!-- John Lewis Block -->
+        <div style="flex: 1; min-width: 280px; background: #fff; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
+            <h3>🛍️ John Lewis Parameters</h3>
+            <label>Price range:
+                <select id="johnlewis_price" style="width: 100%; padding: 6px; margin-top: 6px;">
+                    {% for option in ["0-10", "10.01-35", "35.01-50", "50.01-100", "100.01-150", "150.01-999"] %}
+                        <option value="{{ option }}" {% if johnlewis_settings.price_range == option %}selected{% endif %}>{{ option }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <br><br>
+            <label>Shipping fees:
+                <input id="johnlewis_shipping" type="number" style="width: 100%; padding: 6px; margin-top: 6px;" placeholder="5" value="{{ johnlewis_settings.shipping_fee }}">
+            </label>
+            <br><br>
+            <label>
+                <input id="johnlewis_surcharge" type="checkbox" {% if johnlewis_settings.surcharge %}checked{% endif %}> 10% surcharge
+            </label>
+            <br><br>
+            <button type="button" onclick="saveSettings('johnlewis')">Save the settings</button>
+        </div>
+    </div>
+
+    <div class="status">
+        <div id="addedProductsContainer" style="margin-top: 20px; display: none;">
+            <h2>✅ Added Products:</h2>
+            <ul id="addedProductsList"></ul>
+        </div>
+    </div>
+
+    <div id="spinner" class="spinner" style="display: none;">
+        <div class="spinner-inner"></div>
+        <p>Adding products...</p>
+    </div>
+
+    <script>
+        function saveSettings(source) {
+            const priceRange = document.getElementById(`${source}_price`).value;
+            const shipping = document.getElementById(`${source}_shipping`).value;
+            const surcharge = document.getElementById(`${source}_surcharge`).checked;
+
+            fetch(`/save_settings/${source}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    price_range: priceRange,
+                    shipping_fee: shipping,
+                    surcharge: surcharge
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                alert(data.success ? "✅ Settings are saved" : "❌ Save error");
+            })
+            .catch(() => {
+                alert("❌ Save error");
+            });
+        }
+
+        document.addEventListener("DOMContentLoaded", function () {
+            const editor = document.getElementById('editor');
+            const startButton = document.getElementById("startButton");
+            const realInput = document.getElementById('realInput');
+            const form = document.getElementById("mainForm");
+
+            function updateLinks() {
+                const plain = editor.innerText;
+                const parts = plain.split(/(https?:\/\/[^\s,]+)/g);
+                let html = '';
+                for (let part of parts) {
+                    if (part.match(/^https?:\/\//)) {
+                        html += `<a href="${part}" target="_blank">${part}</a> `;
+                    } else {
+                        html += part.replace(/\n/g, '<br>');
+                    }
+                }
+                editor.innerHTML = html.trim();
+                placeCaretAtEnd(editor);
+            }
+
+            function placeCaretAtEnd(el) {
+                el.focus();
+                if (typeof window.getSelection !== "undefined" && typeof document.createRange !== "undefined") {
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    range.collapse(false);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                }
+            }
+
+            editor.addEventListener('input', updateLinks);
+
+            editor.addEventListener('paste', function(e) {
+                e.preventDefault();
+                const text = (e.clipboardData || window.clipboardData).getData('text');
+                document.execCommand("insertText", false, text);
+            });
+
+        });
+    </script>
+   <script>
+    function pollUntilFinished() {
+    console.log("⏳ Старт опроса /status...");
+    const addedList = document.getElementById("addedProductsList");
+    const addedContainer = document.getElementById("addedProductsContainer");
+
+    const interval = setInterval(async () => {
+        const res = await fetch("/status");
+        const data = await res.json();
+        console.log("📡 Ответ от /status:", data);
+
+        // Показываем список добавленных товаров
+        if (data.products && data.products.length > 0) {
+            addedContainer.style.display = "block";
+            addedList.innerHTML = "";
+            for (let p of data.products) {
+                addedList.innerHTML += `
+                    <li>
+                        <b>${p.title}</b> — ${p.price} — ${p.variant} — Qty: ${p.quantity}<br>
+                        <small><a href="${p.link}" target="_blank">${p.link}</a></small>
+                    </li>`;
+            }
+        }
+
+        if (data.finished) {
+            console.log("✅ Завершено — останавливаем спиннер");
+            clearInterval(interval);
+            document.getElementById("spinner").style.display = "none";
+        }
+    }, 3000);
+    }
+
+    document.addEventListener("DOMContentLoaded", function () {
+        const editor = document.getElementById('editor');
+        const startButton = document.getElementById("startButton");
+        const spinner = document.getElementById("spinner");
+
+        startButton.addEventListener("click", async () => {
+            const links = editor.innerText.trim();
+            if (!links) return alert("❌ Вставьте хотя бы одну ссылку.");
+
+            const invalidLinks = links.split(/\s+/).filter(link =>
+                !link.includes("johnlewis.com") && !link.includes("escentual.com")
+            );
+            if (invalidLinks.length > 0) {
+                return alert("❌ Поддерживаются только ссылки с johnlewis.com и escentual.com:\n\n" + invalidLinks.join("\n"));
+            }
+
+            spinner.style.display = "flex";
+
+            try {
+                const response = await fetch("/", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: new URLSearchParams({ links })
+                });
+
+                const result = await response.json();
+                console.log("🚀 POST / результат:", result);
+
+                pollUntilFinished();  // ✅ вызываем сразу
+
+                if (!result.success) {
+                    alert("❌ Ошибка запуска: " + (result.error || "неизвестная"));
+                }
+            } catch (err) {
+                spinner.style.display = "none";
+                alert("❌ Ошибка отправки запроса.");
+            }
+        });
+    });
+    </script>
+
+
+
+</body>
+</html>

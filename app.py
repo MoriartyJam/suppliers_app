@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template, render_template_string, redirect, url_for
 import re
 import httpx
 import html
@@ -14,16 +14,34 @@ from datetime import datetime
 import os
 from flask import send_file
 import json
+import logging
+from dotenv import load_dotenv
+from threading import Thread
+from collections import defaultdict
+import psutil
+import gc
+from threading import Event
+
+
+
 
 
 CSV_DIR = "./csv_reports"
 os.makedirs(CSV_DIR, exist_ok=True)
+logging.basicConfig(level=logging.INFO)
+load_dotenv()
+added_products = []
+finished = False
+_job_running = Event()
+
+
+
 
 app = Flask(__name__)
 
-SHOPIFY_STORE_URL = os.getenv('SHOPIFY_STORE_URL')
-ACCESS_TOKEN = os.getenv('SHOPIFY_ACCESS_TOKEN')
-LOCATION_ID = os.getenv('LOCATION_ID')
+SHOPIFY_STORE_URL = os.getenv("SHOPIFY_STORE_URL")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+LOCATION_ID = int(os.getenv("LOCATION_ID"))
 
 
 HEADERS = {
@@ -43,7 +61,6 @@ SITE_PARSERS = {
         "size_re": r'<dl[^>]*data-testid="basket:product:attributes:list"[^>]*>.*?<dd[^>]*class="VariantAttributes_attributeValue__5XTlL"[^>]*>(.*?)</dd>',
     }
 }
-
 
 
 
@@ -95,6 +112,27 @@ def extract_handle_variant_sku_from_url(url):
     return handle, variant, sku
 
 
+def load_settings(source):
+    try:
+        with open(os.path.join("settings", f"{source}.json"), "r", encoding="utf-8") as f:
+            settings = json.load(f)
+            # Обратная совместимость со старым форматом
+            if "shipping_fees" not in settings and "price_range" in settings:
+                match = re.match(r"(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)", settings["price_range"])
+                if match:
+                    min_price = float(match.group(1))
+                    max_price = float(match.group(2))
+                    settings["shipping_fees"] = [{
+                        "price_range": [min_price, max_price],
+                        "shipping_fee": float(settings.get("shipping_fee", 0))
+                    }]
+            return settings
+    except Exception as e:
+        print(f"⚠️ Ошибка загрузки настроек: {e}")
+        return {"shipping_fees": [], "surcharge": False}
+
+
+
 def parse_escentual(url):
     r = httpx.get(url, timeout=20)
     soup = BeautifulSoup(r.text, "html.parser")
@@ -119,10 +157,12 @@ def parse_escentual(url):
 
 def parse_product(url, max_retries=3):
     print(f"\n🌐 Запрос к: {url}")
+    logging.info(f"\n🌐 Запрос к: {url}")
     domain = urlparse(url).netloc.replace("www.", "")
     parser = SITE_PARSERS.get(domain)
     if not parser:
         print(f"❌ Нет парсера для: {domain}")
+        logging.info(f"❌ Нет парсера для: {domain}")
         return None
 
     with sync_playwright() as p:
@@ -192,53 +232,38 @@ def parse_product(url, max_retries=3):
     }
 
 
-def calculate_final_price(price, settings):
+def calculate_final_price_create(price, settings):
+    for section in settings["shipping_fees"]:
+        if section["price_range"][0] <= price <= section["price_range"][1]:
+            shipping_fee = float(section.get("shipping_fee", 0))
+            return price + shipping_fee, shipping_fee, True, True
 
-    price_range = settings.get("price_range", "")
-    shipping_fee_form = float(settings.get("shipping_fee", 0))
-    surcharge = settings.get("surcharge", False)
-
-    match = re.match(r"(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)", price_range)
-    min_price = float(match.group(1)) if match else 0
-    max_price = float(match.group(2)) if match else float("inf")
-
-    final_price = price
-    fee_applied = 0
-    surcharge_applied = False
-
-    log_parts = [f"💰 Базовая цена: {price:.2f}"]
-
-    if min_price <= price <= max_price:
-        final_price += shipping_fee_form
-        fee_applied = shipping_fee_form
-        log_parts.append(f"📦 Добавлен shipping fee {shipping_fee_form:.2f} (диапазон {min_price}-{max_price})")
-    else:
-        # применяем дефолтную формулу
-        fallback_fee = 3.95 if price < 75 else 10.50
-        final_price += fallback_fee
-        fee_applied = fallback_fee
-        log_parts.append(f"📦 Цена вне диапазона — применён fallback shipping fee {fallback_fee:.2f}")
-
-    if surcharge:
-        final_price *= 1.1
-        surcharge_applied = True
-        log_parts.append("➕ Добавлена 10% надбавка (surcharge)")
-
-    final_price = round(final_price, 2)
-    log_parts.append(f"✅ Итоговая цена: {final_price:.2f}")
-
-    print(" | ".join(log_parts))
-
-    return final_price, fee_applied, surcharge_applied
-
-def load_settings(source):
-    try:
-        with open(os.path.join("settings", f"{source}.json"), "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {"price_range": "", "shipping_fee": "", "surcharge": False}
+    # fallback для создания
+    fallback_fee = 3.95 if price < 75 else 10.5
+    return price + fallback_fee, fallback_fee, True, False
 
 
+
+def calculate_final_price_update(price, settings, previous_fee_applied=None, is_active_product=False):
+    for section in settings["shipping_fees"]:
+        if section["price_range"][0] <= price <= section["price_range"][1]:
+            shipping_fee = round(float(section.get("shipping_fee", 0)), 2)
+            surcharge = round(price * 0.10, 2) if is_active_product else 0.0
+            total = price + shipping_fee + surcharge
+            return round(total, 2), shipping_fee, surcharge, True
+
+    if previous_fee_applied is not None:
+        shipping_fee = round(previous_fee_applied, 2)
+        surcharge = round(price * 0.10, 2) if is_active_product else 0.0
+        total = price + shipping_fee + surcharge
+        return round(total, 2), shipping_fee, surcharge, False
+
+    return round(price, 2), 0.0, 0.0, False
+
+def print_memory_usage(stage=""):
+    process = psutil.Process(os.getpid())
+    mem = process.memory_info().rss / 1024 / 1024
+    print(f"🧠 [{stage}] Использование памяти: {mem:.2f} MB")
 
 
 def create_shopify_product(parsed_list, site_name, settings):
@@ -260,10 +285,13 @@ def create_shopify_product(parsed_list, site_name, settings):
 
     added_images = set()
     first_item = parsed_list[0]
-    final_price_first, fee_applied, surcharge_applied = calculate_final_price(first_item["price"], settings)
+    final_price, fee_applied, _, _ = calculate_final_price_create(first_item["price"], settings)
+
+
+
 
     for item in parsed_list:
-        final_price, _, _ = calculate_final_price(item["price"], settings)  # нам не нужны повторно fee/surcharge
+        final_price = calculate_final_price_create(item["price"], settings)[0]
 
         images = item["image"] if isinstance(item["image"], list) else [item["image"]]
         for img in images:
@@ -285,6 +313,8 @@ def create_shopify_product(parsed_list, site_name, settings):
 
     try:
         print(f"\n📤 Отправка товара в Shopify: {product_data['title']}")
+        logging.info(f"\n📤 Отправка товара в Shopify: {product_data['title']}")
+
         r = httpx.post(
             f"{SHOPIFY_STORE_URL}/admin/api/2024-01/products.json",
             headers=HEADERS,
@@ -295,17 +325,24 @@ def create_shopify_product(parsed_list, site_name, settings):
 
     except httpx.ReadTimeout:
         print("❌ ReadTimeout: Shopify слишком долго отвечает. Пропуск товара.")
+        logging.info("❌ ReadTimeout: Shopify слишком долго отвечает. Пропуск товара.")
         return
     except httpx.HTTPStatusError as e:
         print(f"❌ Shopify вернул ошибку {e.response.status_code}: {e.response.text}")
+        logging.info(f"❌ Shopify вернул ошибку {e.response.status_code}: {e.response.text}")
+
+
         return
     except Exception as e:
         print(f"❌ Ошибка при создании товара: {e}")
+        logging.info(f"❌ Ошибка при создании товара: {e}")
+
         return
 
     created_product = r.json().get("product")
     if not created_product:
         print("❌ Не удалось распарсить ответ Shopify")
+        logging.info("❌ Не удалось распарсить ответ Shopify")
         return
 
     metafields = [
@@ -325,6 +362,8 @@ def create_shopify_product(parsed_list, site_name, settings):
 
     for metafield in metafields:
         print(f"📦 Добавление метаполя: {metafield['key']} = {metafield['value']}")
+        logging.info(f"📦 Добавление метаполя: {metafield['key']} = {metafield['value']}")
+
 
         try:
             meta_resp = httpx.post(
@@ -335,14 +374,65 @@ def create_shopify_product(parsed_list, site_name, settings):
             )
             if meta_resp.status_code == 201:
                 print(f"✅ Метаполе {metafield['key']} успешно добавлено")
+                logging.info(f"✅ Метаполе {metafield['key']} успешно добавлено")
+
             else:
                 print(f"⚠️ Не удалось добавить метаполе {metafield['key']}: {meta_resp.text}")
+                logging.info(f"⚠️ Не удалось добавить метаполе {metafield['key']}: {meta_resp.text}")
+
         except Exception as e:
             print(f"❌ Ошибка при добавлении метаполя {metafield['key']}: {e}")
+            logging.info(f"❌ Ошибка при добавлении метаполя {metafield['key']}: {e}")
+
+
+def process_links_in_background(links, escentual_settings, johnlewis_settings):
+    global added_products, finished
+    added_products = []
+    finished = False
+
+    try:
+        for link in links:
+            site = get_site_name(link)
+
+            if site == "escentual":
+                parsed = parse_escentual(link)
+                if parsed:
+                    print(f"\n🔍 Обработка escentual: {parsed['title']}")
+                    create_shopify_product([parsed], "escentual", escentual_settings)
+                    added_products.append({
+                        "title": parsed.get("title", "Untitled"),
+                        "link": link,
+                        "price": parsed.get("price", "-"),
+                        "variant": parsed.get("option1") or "-",
+                        "quantity": parsed.get("stock", "-")
+                    })
+
+            elif site == "johnlewis":
+                parsed = parse_product(link)
+                if parsed:
+                    product_name = parsed.get("base_title") or parsed.get("title") or "Без названия"
+                    print(f"\n🔍 Обработка johnlewis: {product_name}")
+                    create_shopify_product([parsed], "johnlewis", johnlewis_settings)
+                    added_products.append({
+                        "title": product_name,
+                        "link": link,
+                        "price": parsed.get("price", "-"),
+                        "variant": parsed.get("option1") or "-",
+                        "quantity": parsed.get("stock", "-")
+                    })
+
+    finally:
+        print("✅ Все товары добавлены, выставляем finished = True")
+        logging.info("✅ Все товары добавлены, выставляем finished = True")
+        finished = True
+
+
 
 
 def update_all_products_from_escentual():
     print("🔁 Начало обновления товаров из escentual.com...")
+    logging.info("🔁 Начало обновления товаров из escentual.com...")
+
     base_url = f"{SHOPIFY_STORE_URL}/admin/api/2024-01/products.json?limit=250"
     all_products = []
     next_url = base_url
@@ -351,6 +441,7 @@ def update_all_products_from_escentual():
         response = httpx.get(next_url, headers=HEADERS)
         if response.status_code != 200:
             print(f"❌ Ошибка при получении товаров: {response.status_code}")
+            logging.info(f"❌ Ошибка при получении товаров: {response.status_code}")
             break
         data = response.json().get("products", [])
         all_products.extend(data)
@@ -363,6 +454,7 @@ def update_all_products_from_escentual():
             next_url = None
 
     print(f"✅ Получено товаров: {len(all_products)}")
+    logging.info(f"✅ Получено товаров: {len(all_products)}")
 
     updated_count = 0
     for product in all_products:
@@ -374,20 +466,33 @@ def update_all_products_from_escentual():
             variant_id = variant["id"]
             inventory_item_id = variant["inventory_item_id"]
 
-            # Получаем метаполе source_url (которое ты сохраняешь при создании)
+            # Получаем метаполе source_url и shipping_fee_applied
             metafields_url = f"{SHOPIFY_STORE_URL}/admin/api/2024-01/products/{product['id']}/metafields.json"
             response = httpx.get(metafields_url, headers=HEADERS)
             if response.status_code != 200:
                 print(f"⚠️ Не удалось получить метафилды для варианта {variant_id}")
+                logging.info(f"⚠️ Не удалось получить метафилды для варианта {variant_id}")
                 continue
 
             metafields = response.json().get("metafields", [])
-            source_url = next(
-                (m["value"] for m in metafields if m["namespace"] == "global" and m["key"] == "source_url"), None)
+            source_url = None
+            previous_fee_applied = 0.0
+
+            for m in metafields:
+                if m["namespace"] == "global" and m["key"] == "source_url":
+                    source_url = m["value"]
+                elif m["namespace"] == "global" and m["key"] == "shipping_fee_applied":
+                    try:
+                        previous_fee_applied = float(m["value"])
+                    except:
+                        previous_fee_applied = 0.0
+
             print(f"🔍 Проверка варианта ID {variant_id}...")
+            logging.info(f"🔍 Проверка варианта ID {variant_id}...")
 
             if not source_url:
                 print(f"ℹ️ Пропущен: не найден source_url для варианта {variant_id}")
+                logging.info(f"ℹ️ Пропущен: не найден source_url для варианта {variant_id}")
                 continue
 
             try:
@@ -395,6 +500,7 @@ def update_all_products_from_escentual():
                 response.raise_for_status()
             except Exception as e:
                 print(f"❌ Ошибка запроса к {source_url}: {e}")
+                logging.info(f"❌ Ошибка запроса к {source_url}: {e}")
                 continue
 
             soup = BeautifulSoup(response.text, "html.parser")
@@ -404,13 +510,19 @@ def update_all_products_from_escentual():
             price = float(re.sub(r"[^\d.]", "", price_tag.text)) if price_tag else 0.0
             stock = int(m.group()) if stock_tag and (m := re.search(r"\d+", stock_tag.text)) else 0
 
-            # Обновляем цену
             # Загружаем настройки
             settings = load_settings("escentual")
 
-            # Проверяем, попадает ли цена в диапазон
-            final_price, fee_applied, surcharge_applied = calculate_final_price(price, settings)
+            # Вычисляем новую цену и fee
+            is_active = product.get("status") == "active"
+
+            # Вычисляем новую цену
+            final_price, fee_applied, surcharge_applied, used_section_fee = calculate_final_price_update(
+                price, settings, previous_fee_applied, is_active_product=is_active
+            )
+
             print("\n📦 Обновление варианта Escentual:")
+            logging.info("\n📦 Обновление варианта Escentual:")
             print(f"🔖 Продукт: {product['title']}")
             print(f"🧾 Вариант: {variant.get('title')}")
             print(f"🌍 Source URL: {source_url}")
@@ -420,34 +532,30 @@ def update_all_products_from_escentual():
             print(f"➕ Надбавка (surcharge): {'да' if surcharge_applied else 'нет'}")
             print(f"✅ Новая цена: {final_price}")
 
-            # Обновляем цену
-            variant_update_url = f"{SHOPIFY_STORE_URL}/admin/api/2024-01/variants/{variant_id}.json"
-            httpx.put(variant_update_url, headers=HEADERS, json={"variant": {"price": final_price}})
-
-            # Обновляем метафилд shipping_fee_applied
-            metafield_payload = {
-                "metafield": {
-                    "namespace": "global",
-                    "key": "shipping_fee_applied",
-                    "value": str(fee_applied),
-                    "type": "number_decimal"
-                }
-            }
-            httpx.post(
-                f"{SHOPIFY_STORE_URL}/admin/api/2024-01/products/{product['id']}/metafields.json",
+            # Обновляем цену в Shopify
+            httpx.put(
+                f"{SHOPIFY_STORE_URL}/admin/api/2024-01/variants/{variant_id}.json",
                 headers=HEADERS,
-                json=metafield_payload
+                json={"variant": {"price": final_price}}
             )
 
-            log_product_to_csv(
-                sku=variant.get("sku"),
-                title=product["title"],
-                variant=variant.get("title"),
-                price=price,
-                quantity=stock,
-                tag="escentual",
-                shipping_fee=fee_applied
-            )
+            # Обновляем метафилд shipping_fee_applied, если fee из секции
+            if fee_applied != previous_fee_applied:
+                print(f"✏️ Обновление метафилда shipping_fee_applied на {fee_applied}")
+                logging.info(f"✏️ Обновление метафилда shipping_fee_applied на {fee_applied}")
+                metafield_payload = {
+                    "metafield": {
+                        "namespace": "global",
+                        "key": "shipping_fee_applied",
+                        "value": str(fee_applied),
+                        "type": "number_decimal"
+                    }
+                }
+                httpx.post(
+                    f"{SHOPIFY_STORE_URL}/admin/api/2024-01/products/{product['id']}/metafields.json",
+                    headers=HEADERS,
+                    json=metafield_payload
+                )
 
             # Обновляем количество
             inventory_url = f"{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels/set.json"
@@ -458,14 +566,29 @@ def update_all_products_from_escentual():
             }
             httpx.post(inventory_url, headers=HEADERS, json=inventory_payload)
 
+            # CSV лог
+            log_product_to_csv(
+                sku=variant.get("sku"),
+                title=product["title"],
+                variant=variant.get("title"),
+                price=price,
+                quantity=stock,
+                tag="escentual",
+                shipping_fee=fee_applied
+            )
+
             print(f"✅ Обновлено: {handle} | Цена: {price} | Остаток: {stock}")
+            logging.info(f"✅ Обновлено: {handle} | Цена: {price} | Остаток: {stock}")
+
             updated_count += 1
 
     print(f"✅ Обновление завершено. Всего обновлено вариантов: {updated_count}")
+    logging.info(f"✅ Обновление завершено. Всего обновлено вариантов: {updated_count}")
 
 
 def update_all_products_from_johnlewis():
     from playwright.sync_api import sync_playwright
+    import gc
 
     print("🔁 Обновление товаров с тегом johnlewis...")
 
@@ -490,103 +613,84 @@ def update_all_products_from_johnlewis():
 
     updated_count = 0
 
-    with sync_playwright() as p:
-        browser = p.webkit.launch(headless=True)
+    for product in all_products:
+        if "johnlewis" not in product.get("tags", ""):
+            continue
 
-        for product in all_products:
-            if "johnlewis" not in product.get("tags", ""):
+        for variant in product.get("variants", []):
+            variant_id = variant["id"]
+            inventory_item_id = variant["inventory_item_id"]
+
+            metafields_url = f"{SHOPIFY_STORE_URL}/admin/api/2024-01/products/{product['id']}/metafields.json"
+            response = httpx.get(metafields_url, headers=HEADERS)
+            if response.status_code != 200:
                 continue
 
-            for variant in product.get("variants", []):
-                variant_id = variant["id"]
-                inventory_item_id = variant["inventory_item_id"]
-                variant_title = variant["title"]
+            metafields = response.json().get("metafields", [])
+            source_url = None
+            previous_fee_applied = 0.0
 
-                metafields_url = f"{SHOPIFY_STORE_URL}/admin/api/2024-01/products/{product['id']}/metafields.json"
-                response = httpx.get(metafields_url, headers=HEADERS)
-                if response.status_code != 200:
-                    print(f"⚠️ Не удалось получить метафилды для товара {product['id']}")
-                    continue
+            for m in metafields:
+                if m["namespace"] == "global" and m["key"] == "source_url":
+                    source_url = m["value"]
+                elif m["namespace"] == "global" and m["key"] == "shipping_fee_applied":
+                    try:
+                        previous_fee_applied = float(m["value"])
+                    except:
+                        previous_fee_applied = 0.0
 
-                metafields = response.json().get("metafields", [])
+            if not source_url:
+                continue
 
-                source_url = next(
-                    (m["value"] for m in metafields if m["namespace"] == "global" and m["key"] == "source_url"),
-                    None
-                )
+            print(f"🌐 Ссылка для парсинга: {source_url}")
 
-                if not source_url:
-                    print(f"⚠️ Пропущен: не найден source_url для варианта {variant['id']}")
-                    continue
+            try:
+                with sync_playwright() as p:
+                    browser = p.webkit.launch(headless=True)
+                    page = browser.new_page()
+                    page.route("**/*", lambda route, request: route.abort()
+                               if request.resource_type in ["image", "stylesheet", "media", "font"]
+                               else route.continue_())
 
-                print(f"\n🌐 Ссылка для парсинга: {source_url}")
-                time.sleep(5)
-
-                try:
-                    page = browser.new_page(
-                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
-                        extra_http_headers={"accept-language": "en-US,en;q=0.9"}
-                    )
-
-                    # retry goto
-                    for attempt in range(2):
-                        try:
-                            page.goto(source_url, timeout=60000)
-                            break
-                        except Exception as e:
-                            print(f"⚠️ Попытка {attempt + 1} — ошибка Playwright: {e}")
-                            if attempt == 1:
-                                raise e
-                            time.sleep(3)
-
-                    # Cookie
+                    page.goto(source_url, timeout=60000)
                     try:
                         page.locator('button:has-text("Allow all")').click(timeout=3000)
-                        print("✅ Cookie-баннер закрыт")
                     except:
-                        print("ℹ️ Cookie-баннер не появился")
+                        pass
 
-                    # Stock
                     try:
                         page.wait_for_selector('[data-testid="product:basket:stock"]', timeout=10000)
                         stock_text = page.locator('[data-testid="product:basket:stock"]').inner_text()
                         match = re.search(r'\d+', stock_text)
-                        if match:
-                            stock = int(match.group())
-                        elif "in stock" in stock_text.lower():
-                            stock = 10
-                        else:
-                            stock = 0
+                        stock = int(match.group()) if match else 10 if "in stock" in stock_text.lower() else 0
                     except:
-                        print("❌ Остаток не найден — устанавливаем 0")
                         stock = 0
 
-                    # Цена — через ScraperAPI
                     try:
                         price_text = page.locator('[data-testid="product:basket:price"]').inner_text()
-                        price = float(re.sub(r"[^\d.]", "", price_text)) if price_text else None
+                        price = float(re.sub(r"[^\d.]", "", price_text)) if price_text else 0.0
                     except:
-                        price = None
+                        price = 0.0
 
-                    print(f"✅ Остаток: {stock} | Цена: {price if price is not None else '—'}")
+                    page.close()
+                    browser.close()
 
-                    # Обновление цены
-                    settings = load_settings("johnlewis")
-                    final_price, fee_applied, surcharge_applied = calculate_final_price(price, settings)
-                    print("\n📦 Обновление варианта JohnLewis:")
-                    print(f"🔖 Продукт: {product['title']}")
-                    print(f"🧾 Вариант: {variant_title}")
-                    print(f"🌍 Source URL: {source_url}")
-                    print(f"💲 Исходная цена с сайта: {price}")
-                    print(f"📦 Остаток: {stock}")
-                    print(f"🔧 Применён shipping fee: {fee_applied}")
-                    print(f"➕ Надбавка (surcharge): {'да' if surcharge_applied else 'нет'}")
-                    print(f"✅ Новая цена: {final_price}")
+                settings = load_settings("johnlewis")
+                is_active = product.get("status") == "active"
 
-                    variant_update_url = f"{SHOPIFY_STORE_URL}/admin/api/2024-01/variants/{variant_id}.json"
-                    httpx.put(variant_update_url, headers=HEADERS, json={"variant": {"price": final_price}})
+                final_price, fee_applied, surcharge_applied, used_section_fee = calculate_final_price_update(
+                    price, settings, previous_fee_applied, is_active_product=is_active
+                )
 
-                    # Обновляем метаполе shipping_fee_applied
+                httpx.put(
+                    f"{SHOPIFY_STORE_URL}/admin/api/2024-01/variants/{variant_id}.json",
+                    headers=HEADERS,
+                    json={"variant": {"price": final_price}}
+                )
+
+                if used_section_fee:
+                    print(f"✏️ Обновление метафилда shipping_fee_applied на {fee_applied}")
+                    logging.info(f"✏️ Обновление метафилда shipping_fee_applied на {fee_applied}")
                     metafield_payload = {
                         "metafield": {
                             "namespace": "global",
@@ -601,63 +705,82 @@ def update_all_products_from_johnlewis():
                         json=metafield_payload
                     )
 
-                    # Обновление остатка
-                    inventory_url = f"{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels/set.json"
-                    inventory_payload = {
+                httpx.post(
+                    f"{SHOPIFY_STORE_URL}/admin/api/2024-01/inventory_levels/set.json",
+                    headers=HEADERS,
+                    json={
                         "location_id": LOCATION_ID,
                         "inventory_item_id": inventory_item_id,
                         "available": stock
                     }
-                    httpx.post(inventory_url, headers=HEADERS, json=inventory_payload)
+                )
 
-                    updated_count += 1
-                    log_product_to_csv(
-                        sku=variant.get("sku"),
-                        title=product["title"],
-                        variant=variant.get("title"),
-                        price=price,
-                        quantity=stock,
-                        tag="johnlewis"
-                    )
+                log_product_to_csv(
+                    sku=variant.get("sku"),
+                    title=product["title"],
+                    variant=variant.get("title"),
+                    price=price,
+                    quantity=stock,
+                    tag="johnlewis",
+                    shipping_fee=fee_applied
+                )
 
-                    page.close()
+                updated_count += 1
+                gc.collect()
 
-                except Exception as e:
-                    print(f"❌ Ошибка при обработке варианта: {e}")
-                    continue
-
-        browser.close()
+            except Exception as e:
+                print(f"❌ Ошибка при обновлении товара: {e}")
+                continue
 
     print(f"\n✅ Обновление завершено. Всего обновлено вариантов: {updated_count}")
 
 
+
 def run_all_updates():
-    print("🚀 Запуск последовательного обновления всех источников...")
+    if _job_running.is_set():
+        logging.info("⏭️ Предыдущий run_all_updates ещё работает — пропускаем запуск.")
+        return
 
-    # Создаём временный файл
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    temp_filename = os.path.join(CSV_DIR, f"~temp_product_update_log.csv")
-    log_product_to_csv.filename = temp_filename
+    _job_running.set()
+    try:
+        print("🚀 Запуск последовательного обновления всех источников...")
+        logging.info("🚀 Запуск последовательного обновления всех источников...")
 
-    update_all_products_from_escentual()
-    update_all_products_from_johnlewis()
+        # Создаём временный файл
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        temp_filename = os.path.join(CSV_DIR, f"~temp_product_update_log.csv")
+        log_product_to_csv.filename = temp_filename
 
-    # После завершения — переименовываем временный файл, если он создан
-    final_filename = os.path.join(CSV_DIR, f"product_update_log_{timestamp}.csv")
+        # Твои же шаги обновления
+        try:
+            update_all_products_from_escentual()
+            update_all_products_from_johnlewis()
+        except Exception:
+            logging.exception("❌ Ошибка во время run_all_updates")
+        finally:
+            # После завершения — переименовываем временный файл, если он создан
+            final_filename = os.path.join(CSV_DIR, f"product_update_log_{timestamp}.csv")
 
-    if os.path.exists(temp_filename):
-        # Удаляем старые завершённые CSV-файлы
-        for f in os.listdir(CSV_DIR):
-            if f.startswith("product_update_log_") and not f.startswith("~") and f.endswith(".csv"):
-                os.remove(os.path.join(CSV_DIR, f))
+            if os.path.exists(temp_filename):
+                # Удаляем старые завершённые CSV-файлы
+                for f in os.listdir(CSV_DIR):
+                    if f.startswith("product_update_log_") and not f.startswith("~") and f.endswith(".csv"):
+                        try:
+                            os.remove(os.path.join(CSV_DIR, f))
+                        except Exception:
+                            pass
 
-        os.rename(temp_filename, final_filename)
-        log_product_to_csv.filename = final_filename
-        print(f"✅ CSV-файл обновлён и готов к скачиванию: {final_filename}")
-    else:
-        print("ℹ️ Обновлений не было — лог не создан, CSV не требуется.")
-        log_product_to_csv.filename = None  # сбрасываем, чтобы не было путаницы
+                os.rename(temp_filename, final_filename)
+                log_product_to_csv.filename = final_filename
+                print(f"✅ CSV-файл обновлён и готов к скачиванию: {final_filename}")
+                logging.info(f"✅ CSV-файл обновлён и готов к скачиванию: {final_filename}")
+            else:
+                print("ℹ️ Обновлений не было — лог не создан, CSV не требуется.")
+                logging.info("ℹ️ Обновлений не было — лог не создан, CSV не требуется.")
+                log_product_to_csv.filename = None  # сбрасываем, чтобы не было путаницы
 
+    finally:
+        _job_running.clear()
 
 
 def log_product_to_csv(sku: str, title: str, variant: str, price: float, quantity: int, tag: str, shipping_fee: float = None):
@@ -693,6 +816,8 @@ def log_product_to_csv(sku: str, title: str, variant: str, price: float, quantit
                  "Quantity", "Tags"])
         writer.writerow(row)
         print(f"📄 CSV строка добавлена: {row}")
+        logging.info(f"📄 CSV строка добавлена: {row}")
+
 
 
 @app.route("/download_csv")
@@ -719,6 +844,7 @@ def download_csv():
     latest_file = os.path.join(CSV_DIR, all_files[0])
 
     print(f"⬇️ Скачивание файла: {latest_file}")
+    logging.info(f"⬇️ Скачивание файла: {latest_file}")
     return send_file(latest_file, as_attachment=True)
 
 
@@ -736,371 +862,78 @@ def save_settings(source):
         return {"success": True}
     except Exception as e:
         print(f"❌ Ошибка сохранения {source}.json: {e}")
+        logging.info(f"❌ Ошибка сохранения {source}.json: {e}")
         return {"success": False}, 500
 
 
+@app.route("/status")
+def status():
+    global added_products, finished
+    print(f"📡 Запрос к /status | finished = {finished}")
+    return jsonify({
+        "products": added_products,
+        "finished": finished
+    })
+
+from flask import Flask, request, render_template, jsonify
+from threading import Thread
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    status = ""
+    global added_products, finished
+    escentual_settings = load_settings("escentual")
+    johnlewis_settings = load_settings("johnlewis")
+    added_products.clear()
+    finished = False
 
+
+    status = ""
 
     def is_settings_valid(settings):
         return bool(settings.get("price_range")) and settings.get("shipping_fee") not in [None, ""]
 
-    escentual_settings = load_settings("escentual")
-    johnlewis_settings = load_settings("johnlewis")
-
     if request.method == "POST":
         if not is_settings_valid(escentual_settings) or not is_settings_valid(johnlewis_settings):
-            status += "<p style='color:red;'>❌ Specify settings in both sections before adding products.</p>"
-        else:
-            print("🚨 Форма отправлена")
-            raw = request.form.get("links", "")
-            print("📥 RAW:", repr(raw))
-            links = [l.strip() for l in raw.splitlines() if l.startswith("https://")]
-            grouped = defaultdict(list)
+            return jsonify({"success": False, "error": "❌ Specify settings in both sections."}), 400
 
-            for link in links:
-                site = get_site_name(link)
-                if site == "escentual":
-                    parsed = parse_escentual(link)
-                    if parsed:
-                        print(f"\n🔍 Обработка escentual: {parsed['title']}")
-                        create_shopify_product([parsed], "escentual", escentual_settings)
-                        status += f"<p>✅ {parsed['title']} added</p>"
-                    else:
-                        status += f"<p style='color:red;'>❌ Не удалось обработать: {link}</p>"
+        raw = request.form.get("links", "")
+        links = [l.strip() for l in raw.splitlines() if l.startswith("https://")]
 
-                elif site == "johnlewis":
-                    parsed = parse_product(link)
-                    if parsed:
-                        product_name = parsed.get("base_title") or parsed.get("title") or "Без названия"
-                        print(f"\n🔍 Обработка johnlewis: {product_name}")
-                        create_shopify_product([parsed], "johnlewis", johnlewis_settings)
-                        status += f"<p>✅ {product_name} added</p>"
-                    else:
-                        status += f"<p style='color:red;'>❌ Failed to process: {link}</p>"
+        thread = Thread(target=process_links_in_background, args=(links, escentual_settings, johnlewis_settings))
+        thread.start()
 
-                else:
-                    print(f"❌ Неизвестный сайт: {link}")
-                    status += f"<p style='color:red;'>❌ Link {link} — is an unsupported site</p>"
-        is_processing = False
+        return jsonify({"success": True, "message": "✅ Добавление запущено."}), 200
 
-    return render_template_string(r"""
-    <!DOCTYPE html>
-    <html lang="ru">
-    <head>
-        <meta charset="UTF-8">
-        <title>Loading Products</title>
-        <style>
-            body {
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-                background-color: #f4f6f8;
-                padding: 40px;
-                color: #202223;
-            }
-            h1 {
-                font-size: 24px;
-                margin-bottom: 20px;
-            }
-            #editor {
-                width: 100%;
-                min-height: 200px;
-                padding: 12px;
-                font-size: 14px;
-                border: 1px solid #ccc;
-                border-radius: 8px;
-                background: #fff;
-                white-space: pre-wrap;
-                outline: none;
-            }
-            #editor a {
-                color: #2a72d4;
-                text-decoration: underline;
-            }
-            button {
-                margin-top: 12px;
-                background-color: #5c6ac4;
-                color: #fff;
-                font-size: 14px;
-                padding: 10px 20px;
-                border: none;
-                border-radius: 6px;
-                cursor: pointer;
-            }
-            button:hover {
-                background-color: #3d4dad;
-            }
-            .status {
-                margin-top: 24px;
-                background: #fff;
-                padding: 16px;
-                border-radius: 8px;
-                border: 1px solid #ddd;
-            }
-            p {
-                margin: 0 0 8px;
-            }
-            #editor:empty:before {
-              content: attr(data-placeholder);
-              color: #aaa;
-              pointer-events: none;
-            }
-            
-            .spinner {
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                flex-direction: column;
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background-color: rgba(255, 255, 255, 0.8);
-                z-index: 9999;
-            }
-            
-            .spinner-inner {
-                border: 6px solid #eee;
-                border-top: 6px solid #5c6ac4;
-                border-radius: 50%;
-                width: 60px;
-                height: 60px;
-                animation: spin 1s linear infinite;
-                margin-bottom: 10px;
-            }
-            
-            @keyframes spin {
-                0% { transform: rotate(0deg); }
-                100% { transform: rotate(360deg); }
-            }
-
-        </style>
-    </head>
-    <body>
-        <h1>Loading products</h1>
-        <form method="post" id="mainForm">
-            <div id="editor" contenteditable="true" data-placeholder="📝 Paste links one per line. Press Enter after each."></div>
-            <textarea name="links" id="realInput" style="display:none;"></textarea>
-            <button id="startButton" type="button">Start the process</button>
-            <button type="button" onclick="window.open('/download_csv', '_blank')">📥 Download the latest CSV</button>
-        </form>
-        <div style="margin-top: 40px; display: flex; gap: 40px; flex-wrap: wrap;">
-    <!-- Escentual Block -->
-    <div style="flex: 1; min-width: 280px; background: #fff; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
-          <h3>🧴 Escentual Parameters</h3>
-          <label>Price range:
-            <select id="escentual_price" style="width: 100%; padding: 6px; margin-top: 6px;">
-              {% for option in ["0-10", "10.01-35", "35.01-50", "50.01-100", "100.01-150", "150.01-999"] %}
-                <option value="{{ option }}" {% if escentual_settings.price_range == option %}selected{% endif %}>{{ option }}</option>
-              {% endfor %}
-            </select>
-          </label>
-          <br><br>
-          <label>Shipping fees:
-            <input id="escentual_shipping" type="number" style="width: 100%; padding: 6px; margin-top: 6px;" placeholder="5" value="{{ escentual_settings.shipping_fee }}">
-          </label>
-          <br><br>
-          <label>
-            <input id="escentual_surcharge" type="checkbox" {% if escentual_settings.surcharge %}checked{% endif %}> 10% surcharge
-          </label>
-          <br><br>
-          <button type="button" onclick="saveSettings('escentual')">Save the settings</button>
-    </div>
-        <!-- John Lewis Block -->
-        <div style="flex: 1; min-width: 280px; background: #fff; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
-           <h3>🛍️ John Lewis Parameters</h3>
-              <label>Price range:
-                <select id="johnlewis_price" style="width: 100%; padding: 6px; margin-top: 6px;">
-                  {% for option in ["0-10", "10.01-35", "35.01-50", "50.01-100", "100.01-150", "150.01-999"] %}
-                    <option value="{{ option }}" {% if johnlewis_settings.price_range == option %}selected{% endif %}>{{ option }}</option>
-                  {% endfor %}
-                </select>
-              </label>
-              <br><br>
-              <label>Shipping fees:
-                <input id="johnlewis_shipping" type="number" style="width: 100%; padding: 6px; margin-top: 6px;" placeholder="5" value="{{ johnlewis_settings.shipping_fee }}">
-              </label>
-              <br><br>
-              <label>
-                <input id="johnlewis_surcharge" type="checkbox" {% if johnlewis_settings.surcharge %}checked{% endif %}> 10% surcharge
-              </label>
-              <br><br>
-              <button type="button" onclick="saveSettings('johnlewis')">Save the settings</button>
-        </div>
-    </div>
-        <div class="status">{{status|safe}}</div>
-        <div id="spinner" class="spinner" style="display: none;">
-          <div class="spinner-inner"></div>
-          <p>Adding products...</p>
-        </div>
+    return render_template("index.html",
+                           status=status,
+                           escentual_settings=escentual_settings,
+                           johnlewis_settings=johnlewis_settings,
+                           added_products=added_products)
 
 
-        <script>
-            document.addEventListener("DOMContentLoaded", function () {
-                const editor = document.getElementById('editor');
-                const startButton = document.getElementById("startButton");
-                const realInput = document.getElementById('realInput');
-                const form = document.getElementById("mainForm");
 
-                function updateLinks() {
-                    const plain = editor.innerText;
-                    const parts = plain.split(/(https?:\/\/[^\s,]+)/g);
-                    let html = '';
-                    for (let part of parts) {
-                        if (part.match(/^https?:\/\//)) {
-                            html += `<a href="${part}" target="_blank">${part}</a> `;
-                        } else {
-                            html += part.replace(/\n/g, '<br>');
-                        }
-                    }
-                    editor.innerHTML = html.trim();
-                    placeCaretAtEnd(editor);
-                }
-                
-                  
-                function placeCaretAtEnd(el) {
-                    el.focus();
-                    if (typeof window.getSelection !== "undefined" && typeof document.createRange !== "undefined") {
-                        const range = document.createRange();
-                        range.selectNodeContents(el);
-                        range.collapse(false);
-                        const sel = window.getSelection();
-                        sel.removeAllRanges();
-                        sel.addRange(range);
-                    }
-                }
+executors = {'default': ThreadPoolExecutor(10)}
 
-                editor.addEventListener('input', updateLinks);
+scheduler = BackgroundScheduler(
+    executors=executors,
+    job_defaults={
+        'coalesce': True,
+        'max_instances': 5,   # было 1 — даём шанс стартовать "пустышкам"
+        'misfire_grace_time': 600
+    }
+)
 
-                editor.addEventListener('paste', function(e) {
-                    e.preventDefault();
-                    const text = (e.clipboardData || window.clipboardData).getData('text');
-                    document.execCommand("insertText", false, text);
-                });
-
-                startButton.addEventListener("click", function () {
-                    // Показываем спиннер сразу
-                    document.getElementById("spinner").style.display = "flex";
-                    console.log("🚀 Кнопка нажата");
-                    const plainText = editor.innerText.trim();
-                    const links = plainText.split(/\s+/).filter(l => l.startsWith("http"));
-                    const invalidLinks = links.filter(link => {
-                        return !link.includes("johnlewis.com") && !link.includes("escentual.com");
-                    });
-
-                    if (invalidLinks.length > 0) {
-                        alert("❌ Unsupported links found:\n\n" + invalidLinks.join("\n") + "\n\nOnly links from johnlewis.com and escentual.com are allowed");
-                        return;
-                    }
-
-                    realInput.value = plainText;
-                    form.submit();
-                });
-
-            });
-            </script>
-            <script>
-                // 👇 Делаем saveSettings глобальной
-                function saveSettings(source) {
-                    const priceRange = document.getElementById(`${source}_price`).value;
-                    const shipping = document.getElementById(`${source}_shipping`).value;
-                    const surcharge = document.getElementById(`${source}_surcharge`).checked;
-            
-                    fetch(`/save_settings/${source}`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            price_range: priceRange,
-                            shipping_fee: shipping,
-                            surcharge: surcharge
-                        })
-                    })
-                    .then(res => res.json())
-                    .then(data => {
-                        alert(data.success ? "✅ Settings are saved" : "❌ Save error");
-                    })
-                    .catch(() => {
-                        alert("❌ Save error");
-                    });
-                }
-            
-                document.addEventListener("DOMContentLoaded", function () {
-                    const editor = document.getElementById('editor');
-                    const startButton = document.getElementById("startButton");
-                    const realInput = document.getElementById('realInput');
-                    const form = document.getElementById("mainForm");
-            
-                    function updateLinks() {
-                        const plain = editor.innerText;
-                        const parts = plain.split(/(https?:\/\/[^\s,]+)/g);
-                        let html = '';
-                        for (let part of parts) {
-                            if (part.match(/^https?:\/\//)) {
-                                html += `<a href="${part}" target="_blank">${part}</a> `;
-                            } else {
-                                html += part.replace(/\n/g, '<br>');
-                            }
-                        }
-                        editor.innerHTML = html.trim();
-                        placeCaretAtEnd(editor);
-                    }
-            
-                    function placeCaretAtEnd(el) {
-                        el.focus();
-                        if (typeof window.getSelection !== "undefined" && typeof document.createRange !== "undefined") {
-                            const range = document.createRange();
-                            range.selectNodeContents(el);
-                            range.collapse(false);
-                            const sel = window.getSelection();
-                            sel.removeAllRanges();
-                            sel.addRange(range);
-                        }
-                    }
-            
-                    editor.addEventListener('input', updateLinks);
-            
-                    editor.addEventListener('paste', function(e) {
-                        e.preventDefault();
-                        const text = (e.clipboardData || window.clipboardData).getData('text');
-                        document.execCommand("insertText", false, text);
-                    });
-            
-                    startButton.addEventListener("click", function () {
-                        document.getElementById("spinner").style.display = "flex";
-                        const plainText = editor.innerText.trim();
-                        const links = plainText.split(/\s+/).filter(l => l.startsWith("http"));
-                        const invalidLinks = links.filter(link => {
-                            return !link.includes("johnlewis.com") && !link.includes("escentual.com");
-                        });
-            
-                        if (invalidLinks.length > 0) {
-                            alert("❌ Unsupported links found:\n\n" + invalidLinks.join("\n") + "\n\nOnly links from johnlewis.com and escentual.com are allowed");
-                            return;
-                        }
-            
-                        realInput.value = plainText;
-                        form.submit();
-                    });
-                });
-            </script>
-
-
-    </body>
-    </html>
-    """, status=status, escentual_settings=escentual_settings,
-        johnlewis_settings=johnlewis_settings )
-
-
-executors = {
-    'default': ThreadPoolExecutor(10)
-}
-
-scheduler = BackgroundScheduler(executors=executors)
-scheduler.add_job(func=run_all_updates, trigger='interval', minutes=20)
+scheduler.add_job(
+    func=run_all_updates,
+    trigger='interval',
+    minutes=40,
+    id='run_all_updates',
+    replace_existing=True,
+    max_instances=5          # на уровне job тоже можно явно указать
+)
 scheduler.start()
 
+
 if __name__ == "__main__":
-    app.run(debug=False)
+    import os
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

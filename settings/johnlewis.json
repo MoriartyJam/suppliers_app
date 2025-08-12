@@ -1,5 +1,5 @@
 {
-  "price_range": "10.01-35",
-  "shipping_fee": "3",
+  "price_range": "50.01-100",
+  "shipping_fee": "4.50",
   "surcharge": true
 }
