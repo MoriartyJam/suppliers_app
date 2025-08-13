@@ -33,6 +33,7 @@ load_dotenv()
 added_products = []
 finished = False
 _job_running = Event()
+MAX_JOB_RUNTIME_SECONDS = 3600
 
 
 
@@ -737,50 +738,75 @@ def update_all_products_from_johnlewis():
 
 
 def run_all_updates():
+    """
+    Последовательное обновление всех источников (Escentual, JohnLewis)
+    с защитой от залипания флага и автоматическим созданием CSV.
+    """
+    # Проверяем, не выполняется ли уже задача
     if _job_running.is_set():
-        logging.info("⏭️ Предыдущий run_all_updates ещё работает — пропускаем запуск.")
-        return
+        # Дополнительно проверяем, не залип ли флаг
+        if hasattr(_job_running, "start_time"):
+            elapsed = time.time() - _job_running.start_time
+            if elapsed > MAX_JOB_RUNTIME_SECONDS:
+                logging.warning("⚠️ Флаг выполнения залип (>1 час). Сбрасываем и запускаем задачу.")
+                _job_running.clear()
+            else:
+                logging.info("⏭️ Задача ещё выполняется — пропускаем запуск.")
+                return
+        else:
+            logging.info("⏭️ Задача ещё выполняется — пропускаем запуск.")
+            return
 
+    # Устанавливаем флаг и сохраняем время старта
     _job_running.set()
+    _job_running.start_time = time.time()
+
     try:
         print("🚀 Запуск последовательного обновления всех источников...")
         logging.info("🚀 Запуск последовательного обновления всех источников...")
 
-        # Создаём временный файл
+        # Создаём временный CSV-файл
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         temp_filename = os.path.join(CSV_DIR, f"~temp_product_update_log.csv")
         log_product_to_csv.filename = temp_filename
 
-        # Твои же шаги обновления
+        # --- Основные шаги обновления ---
         try:
+            # Твои функции обновления — подставь свои реализации
             update_all_products_from_escentual()
             update_all_products_from_johnlewis()
         except Exception:
             logging.exception("❌ Ошибка во время run_all_updates")
-        finally:
-            # После завершения — переименовываем временный файл, если он создан
-            final_filename = os.path.join(CSV_DIR, f"product_update_log_{timestamp}.csv")
+        # --------------------------------
 
-            if os.path.exists(temp_filename):
-                # Удаляем старые завершённые CSV-файлы
-                for f in os.listdir(CSV_DIR):
-                    if f.startswith("product_update_log_") and not f.startswith("~") and f.endswith(".csv"):
-                        try:
-                            os.remove(os.path.join(CSV_DIR, f))
-                        except Exception:
-                            pass
+        # Переименовываем временный файл после успешного обновления
+        final_filename = os.path.join(CSV_DIR, f"product_update_log_{timestamp}.csv")
 
-                os.rename(temp_filename, final_filename)
-                log_product_to_csv.filename = final_filename
-                print(f"✅ CSV-файл обновлён и готов к скачиванию: {final_filename}")
-                logging.info(f"✅ CSV-файл обновлён и готов к скачиванию: {final_filename}")
-            else:
-                print("ℹ️ Обновлений не было — лог не создан, CSV не требуется.")
-                logging.info("ℹ️ Обновлений не было — лог не создан, CSV не требуется.")
-                log_product_to_csv.filename = None  # сбрасываем, чтобы не было путаницы
+        if os.path.exists(temp_filename):
+            # Удаляем старые CSV-файлы
+            for f in os.listdir(CSV_DIR):
+                if f.startswith("product_update_log_") and not f.startswith("~") and f.endswith(".csv"):
+                    try:
+                        os.remove(os.path.join(CSV_DIR, f))
+                    except Exception:
+                        pass
+
+            os.rename(temp_filename, final_filename)
+            log_product_to_csv.filename = final_filename
+            print(f"✅ CSV-файл обновлён и готов к скачиванию: {final_filename}")
+            logging.info(f"✅ CSV-файл обновлён и готов к скачиванию: {final_filename}")
+        else:
+            print("ℹ️ Обновлений не было — лог не создан, CSV не требуется.")
+            logging.info("ℹ️ Обновлений не было — лог не создан, CSV не требуется.")
+            log_product_to_csv.filename = None
 
     finally:
+        # Обязательно сбрасываем флаг в любом случае
         _job_running.clear()
+        if hasattr(_job_running, "start_time"):
+            del _job_running.start_time
+        print("🔚 Задача run_all_updates завершена, флаг сброшен.")
+        logging.info("🔚 Задача run_all_updates завершена, флаг сброшен.")
 
 
 def log_product_to_csv(sku: str, title: str, variant: str, price: float, quantity: int, tag: str, shipping_fee: float = None):
@@ -926,7 +952,7 @@ scheduler = BackgroundScheduler(
 scheduler.add_job(
     func=run_all_updates,
     trigger='interval',
-    minutes=40,
+    minutes=20,
     id='run_all_updates',
     replace_existing=True,
     max_instances=5          # на уровне job тоже можно явно указать
