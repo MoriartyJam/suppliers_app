@@ -86,9 +86,10 @@
     </style>
 </head>
 <body>
-    <h1>Loading products</h1>
+    <h1>Loading products (John Lewis, Escentual, Costco)</h1>
     <form method="post" id="mainForm">
-        <div id="editor" contenteditable="true" data-placeholder="📝 Paste links one per line. Press Enter after each."></div>
+        <div id="editor" contenteditable="true"
+     data-placeholder="📝 Paste links (johnlewis.com, escentual.com, costco.co.uk), one per line. Press Enter after each."></div>
         <textarea name="links" id="realInput" style="display:none;"></textarea>
         <button id="startButton" type="button">Start the process</button>
         <button type="button" onclick="window.open('/download_csv', '_blank')">📥 Download the latest CSV</button>
@@ -137,6 +138,27 @@
             </label>
             <br><br>
             <button type="button" onclick="saveSettings('johnlewis')">Save the settings</button>
+        </div>
+
+        <div style="flex: 1; min-width: 280px; background: #fff; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
+            <h3>🧺 Costco Parameters</h3>
+            <label>Price range:
+                <select id="costco_price" style="width: 100%; padding: 6px; margin-top: 6px;">
+                    {% for option in ["0-10", "10.01-35", "35.01-50", "50.01-100", "100.01-150", "150.01-999"] %}
+                        <option value="{{ option }}" {% if costco_settings.price_range == option %}selected{% endif %}>{{ option }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <br><br>
+            <label>Shipping fees:
+                <input id="costco_shipping" type="number" style="width: 100%; padding: 6px; margin-top: 6px;" placeholder="5" value="{{ costco_settings.shipping_fee }}">
+            </label>
+            <br><br>
+            <label>
+                <input id="costco_surcharge" type="checkbox" {% if costco_settings.surcharge %}checked{% endif %}> 10% surcharge
+            </label>
+            <br><br>
+            <button type="button" onclick="saveSettings('costco')">Save the settings</button>
         </div>
     </div>
 
@@ -261,10 +283,12 @@
             if (!links) return alert("❌ Вставьте хотя бы одну ссылку.");
 
             const invalidLinks = links.split(/\s+/).filter(link =>
-                !link.includes("johnlewis.com") && !link.includes("escentual.com")
+                !link.includes("johnlewis.com") &&
+                !link.includes("escentual.com") &&
+                !link.includes("costco.co.uk")
             );
             if (invalidLinks.length > 0) {
-                return alert("❌ Поддерживаются только ссылки с johnlewis.com и escentual.com:\n\n" + invalidLinks.join("\n"));
+                return alert("❌ Поддерживаются только ссылки с johnlewis.com, escentual.com и costco.co.uk:\n\n" + invalidLinks.join("\n"));
             }
 
             spinner.style.display = "flex";
